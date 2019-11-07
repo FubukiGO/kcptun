@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/sha1"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -16,90 +15,139 @@ import (
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/golang/snappy"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go"
+	"github.com/xtaci/kcptun/generic"
 	"github.com/xtaci/smux"
+	smuxv2 "github.com/xtaci/smux/v2"
+	"github.com/xtaci/tcpraw"
 )
 
-var (
-	// VERSION is injected by buildflags
-	VERSION = "SELFBUILD"
-	// SALT is use for pbkdf2 key expansion
-	SALT = "kcp-go"
-)
+// SALT is use for pbkdf2 key expansion
+const SALT = "kcp-go"
 
-type compStream struct {
-	conn net.Conn
-	w    *snappy.Writer
-	r    *snappy.Reader
-}
+// maximum supported smux version
+const maxSmuxVer = 2
 
-func (c *compStream) Read(p []byte) (n int, err error) {
-	return c.r.Read(p)
-}
+// VERSION is injected by buildflags
+var VERSION = "SELFBUILD"
 
-func (c *compStream) Write(p []byte) (n int, err error) {
-	n, err = c.w.Write(p)
-	err = c.w.Flush()
-	return n, err
-}
-
-func (c *compStream) Close() error {
-	return c.conn.Close()
-}
-
-func newCompStream(conn net.Conn) *compStream {
-	c := new(compStream)
-	c.conn = conn
-	c.w = snappy.NewBufferedWriter(conn)
-	c.r = snappy.NewReader(conn)
-	return c
-}
+// A pool for stream copying
+var xmitBuf sync.Pool
 
 // handle multiplex-ed connection
-func handleMux(conn io.ReadWriteCloser, config *Config) {
-	// stream multiplex
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.MaxReceiveBuffer = config.SockBuf
-	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
-
-	mux, err := smux.Server(conn, smuxConfig)
-	if err != nil {
-		log.Println(err)
-		return
+func handleMux(conn net.Conn, config *Config) {
+	// check if target is unix domain socket
+	var isUnix bool
+	if _, _, err := net.SplitHostPort(config.Target); err != nil {
+		isUnix = true
 	}
-	defer mux.Close()
-	for {
-		p1, err := mux.AcceptStream()
+	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
+
+	// stream multiplex
+	var muxer generic.Mux
+	switch config.SmuxVer {
+	case 1:
+		smuxConfig := smux.DefaultConfig()
+		smuxConfig.MaxReceiveBuffer = config.SmuxBuf
+		smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+		mux, err := smux.Server(conn, smuxConfig)
 		if err != nil {
 			log.Println(err)
 			return
 		}
-		p2, err := net.DialTimeout("tcp", config.Target, 5*time.Second)
+		defer mux.Close()
+		muxer = mux
+	case 2:
+		smuxConfig := smuxv2.DefaultConfig()
+		smuxConfig.MaxReceiveBuffer = config.SmuxBuf
+		smuxConfig.MaxStreamBuffer = config.StreamBuf
+		smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+		mux, err := smuxv2.Server(conn, smuxConfig)
 		if err != nil {
-			p1.Close()
 			log.Println(err)
-			continue
+			return
 		}
-		go handleClient(p1, p2, config.Quiet)
+		defer mux.Close()
+		muxer = mux
+	default:
+		panic("incorrect smux version")
+	}
+
+	for {
+		stream, err := muxer.Accept()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		go func(p1 io.ReadWriteCloser) {
+			var p2 net.Conn
+			var err error
+			if !isUnix {
+				p2, err = net.Dial("tcp", config.Target)
+			} else {
+				p2, err = net.Dial("unix", config.Target)
+			}
+
+			if err != nil {
+				log.Println(err)
+				p1.Close()
+				return
+			}
+			handleClient(p1, p2, config.Quiet)
+		}(stream)
 	}
 }
 
-func handleClient(p1, p2 io.ReadWriteCloser, quiet bool) {
-	if !quiet {
-		log.Println("stream opened")
-		defer log.Println("stream closed")
+func handleClient(p1 io.ReadWriteCloser, p2 net.Conn, quiet bool) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
 	}
+
 	defer p1.Close()
 	defer p2.Close()
 
-	// tunnel setup
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { io.Copy(p1, p2); wg.Done() }()
-	go func() { io.Copy(p2, p1); wg.Done() }()
-	wg.Wait()
+	if s1, ok := p1.(generic.Stream); ok {
+		logln("stream opened", "in:", fmt.Sprint(s1.RemoteAddr(), "(", s1.ID(), ")"), "out:", p2.RemoteAddr())
+		defer logln("stream closed", "in:", fmt.Sprint(s1.RemoteAddr(), "(", s1.ID(), ")"), "out:", p2.RemoteAddr())
+	}
+
+	// start tunnel & wait for tunnel termination
+	streamCopy := func(dst io.Writer, src io.ReadCloser) chan struct{} {
+		die := make(chan struct{})
+		go func() {
+			buf := xmitBuf.Get().([]byte)
+			if _, err := generic.CopyBuffer(dst, src, buf); err != nil {
+				if s1, ok := p1.(generic.Stream); ok {
+					// verbose error handling
+					cause := err
+					if e, ok := err.(interface{ Cause() error }); ok {
+						cause = e.Cause()
+					}
+
+					switch cause {
+					case smux.ErrInvalidProtocol:
+						log.Println("smux version:1", err, "in:", fmt.Sprint(s1.RemoteAddr(), "(", s1.ID(), ")"), "out:", p2.RemoteAddr())
+					case smuxv2.ErrInvalidProtocol:
+						log.Println("smux version:2", err, "in:", fmt.Sprint(s1.RemoteAddr(), "(", s1.ID(), ")"), "out:", p2.RemoteAddr())
+					}
+				}
+			}
+			xmitBuf.Put(buf)
+			close(die)
+		}()
+		return die
+	}
+
+	select {
+	case <-streamCopy(p1, p2):
+	case <-streamCopy(p2, p1):
+	}
 }
 
 func checkError(err error) {
@@ -115,6 +163,10 @@ func main() {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
+	xmitBuf.New = func() interface{} {
+		return make([]byte, 32768)
+	}
+
 	myApp := cli.NewApp()
 	myApp.Name = "kcptun"
 	myApp.Usage = "server(with SMUX)"
@@ -128,7 +180,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "target, t",
 			Value: "127.0.0.1:12948",
-			Usage: "target server address",
+			Usage: "target server address, or path/to/unix_socket",
 		},
 		cli.StringFlag{
 			Name:   "key",
@@ -206,14 +258,29 @@ func main() {
 			Hidden: true,
 		},
 		cli.IntFlag{
-			Name:   "sockbuf",
-			Value:  4194304, // socket buffer size in bytes
-			Hidden: true,
+			Name:  "sockbuf",
+			Value: 4194304, // socket buffer size in bytes
+			Usage: "per-socket buffer in bytes",
 		},
 		cli.IntFlag{
-			Name:   "keepalive",
-			Value:  10, // nat keepalive interval in seconds
-			Hidden: true,
+			Name:  "smuxver",
+			Value: 1,
+			Usage: "specify smux version, available 1,2",
+		},
+		cli.IntFlag{
+			Name:  "smuxbuf",
+			Value: 4194304,
+			Usage: "the overall de-mux buffer in bytes",
+		},
+		cli.IntFlag{
+			Name:  "streambuf",
+			Value: 2097152,
+			Usage: "per stream receive buffer in bytes, smux v2+",
+		},
+		cli.IntFlag{
+			Name:  "keepalive",
+			Value: 10, // nat keepalive interval in seconds
+			Usage: "seconds between heartbeats",
 		},
 		cli.StringFlag{
 			Name:  "snmplog",
@@ -237,6 +304,10 @@ func main() {
 		cli.BoolFlag{
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
+		},
+		cli.BoolFlag{
+			Name:  "tcp",
+			Usage: "to emulate a TCP connection(linux)",
 		},
 		cli.StringFlag{
 			Name:  "c",
@@ -264,12 +335,16 @@ func main() {
 		config.Resend = c.Int("resend")
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
+		config.SmuxBuf = c.Int("smuxbuf")
+		config.StreamBuf = c.Int("streambuf")
+		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Pprof = c.Bool("pprof")
 		config.Quiet = c.Bool("quiet")
+		config.TCP = c.Bool("tcp")
 
 		if c.String("c") != "" {
 			//Now only support json config file
@@ -297,7 +372,35 @@ func main() {
 		}
 
 		log.Println("version:", VERSION)
+		log.Println("smux version:", config.SmuxVer)
+		log.Println("listening on:", config.Listen)
+		log.Println("target:", config.Target)
+		log.Println("encryption:", config.Crypt)
+		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
+		log.Println("compression:", !config.NoComp)
+		log.Println("mtu:", config.MTU)
+		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
+		log.Println("acknodelay:", config.AckNodelay)
+		log.Println("dscp:", config.DSCP)
+		log.Println("sockbuf:", config.SockBuf)
+		log.Println("smuxbuf:", config.SmuxBuf)
+		log.Println("streambuf:", config.StreamBuf)
+		log.Println("keepalive:", config.KeepAlive)
+		log.Println("snmplog:", config.SnmpLog)
+		log.Println("snmpperiod:", config.SnmpPeriod)
+		log.Println("pprof:", config.Pprof)
+		log.Println("quiet:", config.Quiet)
+		log.Println("tcp:", config.TCP)
+
+		// parameters check
+		if config.SmuxVer > maxSmuxVer {
+			log.Fatal("unsupported smux version:", config.SmuxVer)
+		}
+
+		log.Println("initiating key derivation")
 		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+		log.Println("key derivation done")
 		var block kcp.BlockCrypt
 		switch config.Crypt {
 		case "sm4":
@@ -329,90 +432,64 @@ func main() {
 			block, _ = kcp.NewAESBlockCrypt(pass)
 		}
 
-		lis, err := kcp.ListenWithOptions(config.Listen, block, config.DataShard, config.ParityShard)
-		checkError(err)
-		log.Println("listening on:", lis.Addr())
-		log.Println("target:", config.Target)
-		log.Println("encryption:", config.Crypt)
-		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
-		log.Println("compression:", !config.NoComp)
-		log.Println("mtu:", config.MTU)
-		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
-		log.Println("acknodelay:", config.AckNodelay)
-		log.Println("dscp:", config.DSCP)
-		log.Println("sockbuf:", config.SockBuf)
-		log.Println("keepalive:", config.KeepAlive)
-		log.Println("snmplog:", config.SnmpLog)
-		log.Println("snmpperiod:", config.SnmpPeriod)
-		log.Println("pprof:", config.Pprof)
-		log.Println("quiet:", config.Quiet)
-
-		if err := lis.SetDSCP(config.DSCP); err != nil {
-			log.Println("SetDSCP:", err)
-		}
-		if err := lis.SetReadBuffer(config.SockBuf); err != nil {
-			log.Println("SetReadBuffer:", err)
-		}
-		if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
-			log.Println("SetWriteBuffer:", err)
-		}
-
-		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go generic.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 		if config.Pprof {
 			go http.ListenAndServe(":6060", nil)
 		}
 
-		for {
-			if conn, err := lis.AcceptKCP(); err == nil {
-				log.Println("remote address:", conn.RemoteAddr())
-				conn.SetStreamMode(true)
-				conn.SetWriteDelay(true)
-				conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-				conn.SetMtu(config.MTU)
-				conn.SetWindowSize(config.SndWnd, config.RcvWnd)
-				conn.SetACKNoDelay(config.AckNodelay)
+		// main loop
+		var wg sync.WaitGroup
+		loop := func(lis *kcp.Listener) {
+			defer wg.Done()
+			if err := lis.SetDSCP(config.DSCP); err != nil {
+				log.Println("SetDSCP:", err)
+			}
+			if err := lis.SetReadBuffer(config.SockBuf); err != nil {
+				log.Println("SetReadBuffer:", err)
+			}
+			if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
+				log.Println("SetWriteBuffer:", err)
+			}
 
-				if config.NoComp {
-					go handleMux(conn, &config)
+			for {
+				if conn, err := lis.AcceptKCP(); err == nil {
+					log.Println("remote address:", conn.RemoteAddr())
+					conn.SetStreamMode(true)
+					conn.SetWriteDelay(false)
+					conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+					conn.SetMtu(config.MTU)
+					conn.SetWindowSize(config.SndWnd, config.RcvWnd)
+					conn.SetACKNoDelay(config.AckNodelay)
+
+					if config.NoComp {
+						go handleMux(conn, &config)
+					} else {
+						go handleMux(generic.NewCompStream(conn), &config)
+					}
 				} else {
-					go handleMux(newCompStream(conn), &config)
+					log.Printf("%+v", err)
 				}
-			} else {
-				log.Printf("%+v", err)
 			}
 		}
+
+		if config.TCP { // tcp dual stack
+			if conn, err := tcpraw.Listen("tcp", config.Listen); err == nil {
+				lis, err := kcp.ServeConn(block, config.DataShard, config.ParityShard, conn)
+				checkError(err)
+				wg.Add(1)
+				go loop(lis)
+			} else {
+				log.Println(err)
+			}
+		}
+
+		// udp stack
+		lis, err := kcp.ListenWithOptions(config.Listen, block, config.DataShard, config.ParityShard)
+		checkError(err)
+		wg.Add(1)
+		go loop(lis)
+		wg.Wait()
+		return nil
 	}
 	myApp.Run(os.Args)
-}
-
-func snmpLogger(path string, interval int) {
-	if path == "" || interval == 0 {
-		return
-	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			f, err := os.OpenFile(time.Now().Format(path), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			w := csv.NewWriter(f)
-			// write header in empty file
-			if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
-				if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
-					log.Println(err)
-				}
-			}
-			if err := w.Write(append([]string{fmt.Sprint(time.Now().Unix())}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
-				log.Println(err)
-			}
-			kcp.DefaultSnmp.Reset()
-			w.Flush()
-			f.Close()
-		}
-	}
 }
